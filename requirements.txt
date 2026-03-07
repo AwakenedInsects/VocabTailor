@@ -1,0 +1,13 @@
+# Core dependencies (match pyproject.toml).
+# Install with: pip install -r requirements.txt
+# Then install package: pip install -e .
+# Optional extras (profiling, dev, hub, ie): see pyproject.toml and pip install -e ".[profiling]" etc.
+
+torch>=2.1
+transformers>=4.54
+lmdb
+psutil
+accelerate
+safetensors
+huggingface_hub
+tqdm

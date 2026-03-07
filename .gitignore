@@ -1,0 +1,16 @@
+__pycache__/
+*.egg-info/
+.eggs/
+dist/
+build/
+.pytest_cache/
+*.pyc
+.Python
+*.pyo
+*.so
+.env
+.venv/
+venv/
+datasets/
+results/
+lmdb_store/
