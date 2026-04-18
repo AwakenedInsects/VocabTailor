@@ -1,7 +1,7 @@
 # VocabTailor
 
 <a href="https://arxiv.org/abs/2508.15229">
-  <img alt="arxiv" src="https://img.shields.io/badge/arXiv-%3C2406.02540%3E-%23a72f20.svg">
+  <img alt="arxiv" src="https://img.shields.io/badge/arXiv-2508.15229-b31b1b.svg">
 </a>
 
 Input-aware vocabulary tailoring for causal LMs (e.g. Qwen3): reduce memory and compute at inference by using only a subset of the vocabulary per request. Supports optional LMDB offloading and multiple resize strategies (realloc, split_linear, prealloc).
