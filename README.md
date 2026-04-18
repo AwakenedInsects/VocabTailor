@@ -1,8 +1,8 @@
 # VocabTailor
 
 <a href="https://arxiv.org/abs/2508.15229">
-  <img alt="arxiv" src="https://img.shields.io/badge/arXiv-2508.15229-b31b1b.svg">
-</a>
+<img alt="arXiv" src="https://img.shields.io/badge/arXiv-2508.15229-b31b1b.svg"
+></a>
 
 Input-aware vocabulary tailoring for causal LMs (e.g. Qwen3): reduce memory and compute at inference by using only a subset of the vocabulary per request. Supports optional LMDB offloading and multiple resize strategies (realloc, split_linear, prealloc).
 
@@ -32,7 +32,6 @@ See [requirements.txt](requirements.txt) and [pyproject.toml](pyproject.toml) fo
 
 - `[profiling]` — `datasets` (for `vocab-tailor-build-vocab` CLI)
 - `[dev]` — `datasets`, `evaluate` (for validation scripts)
-- `[hub]` — `huggingface_hub` (included in core)
 - `[ie]` — `lm-eval` (for information-extraction workflows)
 
 ## Project structure
