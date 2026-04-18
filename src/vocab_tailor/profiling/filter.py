@@ -49,6 +49,8 @@ class VocabTailorFilter:
         dataset_name: Optional[str] = None,
     ) -> None:
         """
+        Initialize the filter with tokenizer, dataset, and column names.
+
         Args:
             tokenizer (Any): Hugging Face tokenizer.
             dataset (Any): Dataset with columns input_colname and output_colname (e.g. HF Dataset).

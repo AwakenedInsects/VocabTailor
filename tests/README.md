@@ -2,6 +2,18 @@
 
 This directory contains the tests included in the package.
 
+## One-shot validation: `validate.sh`
+
+Runs profiling pipeline validation and full model package validation in sequence. Sets `REPO_ROOT` from the script location, so you can run it from the repository root or from `tests/`. Exits on first failure (`set -e`).
+
+**Run:**
+
+```bash
+bash tests/validate.sh
+```
+
+From repository root, or `./validate.sh` when already in `tests/`. See sections below for dataset requirements and individual script options.
+
 ## Downloading datasets
 
 The validation scripts expect data under the repository root at `datasets/`. These datasets are not shipped with the package (they are large). Download them from Hugging Face and place files under `repo/datasets/` as follows:
@@ -13,11 +25,13 @@ The validation scripts expect data under the repository root at `datasets/`. The
 | Profiling Run 3 (summarization) | `xsum/xsum_train.jsonl` | `EdinburghNLP/xsum` |
 | Full model validation | `wmt24pp/en-zh_CN.jsonl` | Your WMT-style JSONL (source/target columns) |
 
+The same paths (e.g. `wmt24pp/en-zh_CN.jsonl`, `wmt24pp/en-it_IT.jsonl`) are used by the [machine translation benchmarks](../benchmarks/README.md#machine-translation).
+
 Example: from the repo root, use the `datasets` library to download and save (e.g. `load_dataset("Helsinki-NLP/opus-100", "en-zh", split="train")` then save the split to `datasets/opus-100/en-zh/` in the format the script expects). Adjust for xsum and for your MT eval JSONL.
 
 ## Smoke tests: `test_vocab_tailor.py`
 
-Package import, version format, and `from_pretrained` with and without LMDB. No dataset required.
+Package import, version format, `from_pretrained` (with and without LMDB), and `generate()` return value and `gen_metrics` when the tracker is enabled. No dataset required; the first run downloads the model from Hugging Face (`Qwen/Qwen3-1.7B`).
 
 **Run (from repository root):**
 

@@ -5,7 +5,7 @@ import json
 import logging
 import os
 import time
-from typing import Optional, Tuple, Dict, Any
+from typing import Optional, Dict, Any
 
 import torch
 from torch import nn
@@ -13,7 +13,7 @@ from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
     RepetitionPenaltyLogitsProcessor,
-    logging,
+    logging as tf_logging,
 )
 
 from .split_linear import SplitLinear
@@ -23,7 +23,7 @@ from .model_utils import check_weight_sharing, load_model_backbone
 
 
 os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
-logging.set_verbosity_error()
+tf_logging.set_verbosity_error()
 
 
 def _bytes_to_gb(num_bytes: int) -> float:
@@ -351,7 +351,7 @@ class LockedLMHead(nn.Module):
     def _extend_head_splitlinear(self, new_inds: torch.Tensor) -> None:
         """
         Extends the current LM head to include new vocabulary indices using a split-architecture approach.
-        
+
         Args:
             new_inds (torch.Tensor): A 1D tensor containing the unique indices from the full vocabulary that need to be added to the current head.
         """
@@ -491,13 +491,20 @@ class VocabTailor:
     including Qwen, Llama, Mistral, and DeepSeek. Qwen3 is the primary tested
     model; this class is a thin layer over OffloadEmbedding + LockedLMHead for
     use from downstream code and examples.
+
+    Attributes:
+        tracker: None by default; set when enable_metrics_tracker=True in
+            from_pretrained() or load_model(). No need to set vt.tracker = None
+            when using enable_metrics_tracker=False.
+        gen_metrics: After generate(), holds per-run metrics (e.g. prefill_time,
+            decode_tps) when tracker is enabled; None when tracker is disabled.
     """
 
     def __init__(self):
         self.model: Optional[AutoModelForCausalLM] = None
         self.tokenizer = None
         self.device: Optional[str] = None
-        self.tracker = MetricsTracker()
+        self.tracker: Optional[MetricsTracker] = None
         self.provider: Optional[LMDBWeightProvider] = None
         self.offload_to_lmdb: bool = False
         self.dtype = None
@@ -531,8 +538,9 @@ class VocabTailor:
         dtype: Optional[str | torch.dtype] = "bf16",
         lmdb_path: Optional[str] = None,
         vocab_resize_strategy: str = "prealloc",
-        tokenizer_kwargs: Optional[Dict[str, Any]] = None,
         profiling_file: Optional[str] = None,
+        enable_metrics_tracker: bool = False,
+        tokenizer_kwargs: Optional[Dict[str, Any]] = None,
         **model_kwargs: Any,
     ) -> "VocabTailor":
         """
@@ -543,17 +551,19 @@ class VocabTailor:
         tested model.
 
         Args:
-            model_name_or_path (str): Hugging Face Hub model id (e.g. "Qwen/Qwen2.5-0.5B-Instruct")
+            model_name_or_path (str): Hugging Face Hub model id (e.g. "Qwen/Qwen3-1.7B")
                 or local path to the model directory.
             device (str): Target device for transformer blocks.
             dtype (str or torch.dtype, optional): Torch dtype or string alias.
             lmdb_path (str, optional): Path to LMDB weights (if using LMDB offload).
             vocab_resize_strategy (str): 'realloc' | 'split_linear' | 'prealloc'.
-            tokenizer_kwargs (dict, optional): Extra kwargs for tokenizer loading (e.g. token=, trust_remote_code=).
             profiling_file (str, optional): Path to a JSON task vocabulary (from vocab-tailor-build-vocab).
                 If provided and the file exists, the LM head is initialized with these token IDs
                 plus special tokens. JSON must be a dict (token string -> id) or a list of token ids.
                 If the path does not exist, a warning is logged and no update is performed.
+            enable_metrics_tracker (bool): Whether to enable metrics tracker. Defaults to False.
+                When False, tracker remains None and no cleanup is needed.
+            tokenizer_kwargs (dict, optional): Extra kwargs for tokenizer loading (e.g. token=, trust_remote_code=).
             **model_kwargs: Extra kwargs forwarded to AutoModelForCausalLM.from_pretrained
                 (e.g. token=, use_auth_token=, trust_remote_code= for Hub or gated models).
 
@@ -561,6 +571,8 @@ class VocabTailor:
             VocabTailor: Initialized wrapper ready for generate().
         """
         torch_dtype = cls._resolve_dtype(dtype)
+        if dtype is not None and torch_dtype is None:
+            raise ValueError(f"dtype must be one of 'bf16', 'bfloat16', 'fp16', 'float16', 'fp32', 'float32' or a torch.dtype, got {dtype!r}")
 
         # Initialize model
         if lmdb_path:
@@ -597,7 +609,8 @@ class VocabTailor:
             model = model, 
             device=device, 
             lmdb_path=lmdb_path, 
-            vocab_resize_strategy=vocab_resize_strategy
+            vocab_resize_strategy=vocab_resize_strategy,
+            enable_metrics_tracker=enable_metrics_tracker,
         )
 
         # Initialize and update LM head: with static task-specific vocab from profiling_file if given, else special tokens only.
@@ -605,10 +618,7 @@ class VocabTailor:
         init_ids = torch.tensor(special_ids, dtype=torch.long, device="cpu")
         if profiling_file is not None:
             if not os.path.isfile(profiling_file):
-                logging.getLogger(__name__).warning(
-                    "profiling_file %r does not exist; using special token ids only for LM head.",
-                    profiling_file,
-                )
+                logging.getLogger(__name__).warning(f"profiling_file {profiling_file} does not exist; using special token ids only for LM head.")
             else:
                 with open(profiling_file, 'r', encoding="utf-8") as f:
                     data = json.load(f)
@@ -632,7 +642,7 @@ class VocabTailor:
         return vt
 
     # ------------------------------------------------------------------
-    # Core wiring: identical to original VocabTailor.load_model/generate
+    # Core wiring
     # ------------------------------------------------------------------
 
     def load_model(
@@ -641,6 +651,7 @@ class VocabTailor:
         device: str = "cuda",
         lmdb_path: Optional[str] = None,
         vocab_resize_strategy: str = "prealloc",
+        enable_metrics_tracker: bool = False,
     ) -> None:
         """
         Hybrid-loads a model by moving transformer blocks to GPU and offloading embeddings/heads to LMDB or CPU.
@@ -653,16 +664,22 @@ class VocabTailor:
                 If None, it wraps existing CPU weights.
             vocab_resize_strategy (str): Strategy for handling the local sub-vocabulary buffer.
                 Values include "realloc", "split_linear", "prealloc". Defaults to "prealloc".
+            enable_metrics_tracker (bool): Whether to enable metrics tracker. Defaults to False.
+                When False, tracker remains None.
         """
         self.model = model
         self.device = device
         self.provider = None
         self.offload_to_lmdb = lmdb_path is not None
         self.dtype = model.dtype
+        self.tracker = MetricsTracker() if enable_metrics_tracker else None
 
         # Disable HF weight tying before swapping modules
         self.model.config.tie_word_embeddings = False
         
+        # Move Transformer Blocks to target device
+        print(f"Move transformer blocks to {device}...")
+
         if lmdb_path:
             # Move transformer blocks to device (embeddings + lm_head stay meta/CPU)
             for name, module in self.model.named_children():
@@ -746,7 +763,7 @@ class VocabTailor:
         max_new_tokens: int = 128,
         original_eos_token_id: Optional[int] = None,
         **generate_kwargs: Any,
-    ) -> Tuple[torch.Tensor, Optional[Dict[str, float]]]:
+    ) -> torch.Tensor:
         """
         Run generation with optional input-aware pruning.
 
@@ -758,33 +775,24 @@ class VocabTailor:
             do_sample (bool, optional): Whether to sample. Defaults to False.
             max_new_tokens (int, optional): Maximum new tokens to generate. Defaults to 128.
             original_eos_token_id (int, optional): EOS token id in original vocab for stopping.
-            **generate_kwargs: Passed to model.generate().
+            **generate_kwargs: Forwarded to model.generate() (e.g. temperature, top_p).
 
         Returns:
-            Tuple[torch.Tensor, Optional[Dict[str, float]]]: (output_ids, metrics_dict_or_none).
-            output_ids is a LongTensor in original vocabulary space (prompt + generated), suitable for
-            tokenizer.batch_decode(output_ids).
+            torch.Tensor: Generated token ids in original vocabulary space (prompt + generated).
+            Per-run metrics (prefill_time, decode_tps, etc.) are stored in self.gen_metrics
+            when the tracker is enabled; self.gen_metrics is None otherwise.
         """
-        # # Normalize inputs_ids to tensor (accept BatchEncoding or dict with "input_ids" key)
-        # if not isinstance(inputs_ids, torch.Tensor):
-        #     inputs_ids = inputs_ids.get("input_ids", inputs_ids)
-        # if not isinstance(inputs_ids, torch.Tensor):
-        #     raise TypeError("inputs_ids must be a tensor, BatchEncoding, or dict with 'input_ids' key")
-        # inputs_ids = inputs_ids.cpu()
-
         # 1. Setup Generation
-        metrics: Optional[Dict[str, float]] = None
-        LMDB_METRICS: list[str] = []
-
+        self.gen_metrics, LMDB_METRICS = None, None
         if self.tracker:
-            metrics = {}
+            self.gen_metrics, LMDB_METRICS = {}, []
             if self.offload_to_lmdb:
                 LMDB_METRICS = [
                     f"lmdb_{prefix}_{name}"
                     for name in ["time", "calls", "tokens"]
                     for prefix in ["emb", "head"]
                 ]
-                metrics = {k: self.tracker.__dict__[f"total_{k}"] for k in LMDB_METRICS}
+                self.gen_metrics = {k: self.tracker.__dict__[f"total_{k}"] for k in LMDB_METRICS}
 
         inputs_embeds = self.model.model.embed_tokens.full_embedding(inputs_ids).detach()
         new_eos_token_id = (self.model.lm_head.current_inds == original_eos_token_id).nonzero()
@@ -831,7 +839,7 @@ class VocabTailor:
             if self.offload_to_lmdb:
                 for k in LMDB_METRICS:
                     curr_val = self.tracker.__dict__[f"total_{k}"]
-                    metrics[k] = curr_val - metrics[k]
+                    self.gen_metrics[k] = curr_val - self.gen_metrics[k]
 
             output_tokens_count = output_ids[0][len(inputs_ids[0]) :].numel()
 
@@ -845,7 +853,7 @@ class VocabTailor:
             self.model.lm_head.reset_head()
 
         # 7. Update tracker
-        if self.tracker and metrics is not None:
+        if self.tracker:
             self.tracker.total_prefill_time += prefill_dt
             self.tracker.total_decode_time += decode_dt
             self.tracker.total_prefill_tokens += input_tokens_count
@@ -854,10 +862,10 @@ class VocabTailor:
 
             if self.offload_to_lmdb:
                 for prefix in ["lmdb_emb", "lmdb_head"]:
-                    metrics[f"{prefix}_tps"] = _safe_div(metrics[f"{prefix}_tokens"], metrics[f"{prefix}_time"])
-                    metrics[f"{prefix}_latency"] = _safe_div(metrics[f"{prefix}_time"], metrics[f"{prefix}_calls"])
+                    self.gen_metrics[f"{prefix}_tps"] = _safe_div(self.gen_metrics[f"{prefix}_tokens"], self.gen_metrics[f"{prefix}_time"])
+                    self.gen_metrics[f"{prefix}_latency"] = _safe_div(self.gen_metrics[f"{prefix}_time"], self.gen_metrics[f"{prefix}_calls"])
 
-            metrics.update(
+            self.gen_metrics.update(
                 {
                     "dynamic_loading_time": dynamic_loading_dt,
                     "prefill_time": prefill_dt,
@@ -869,7 +877,7 @@ class VocabTailor:
                 }
             )
 
-        return result, metrics
+        return result
 
     def input_aware_pruning(self, inputs_ids: torch.Tensor) -> None:
         sorted_inputs, _ = torch.sort(torch.unique(inputs_ids))

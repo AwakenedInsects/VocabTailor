@@ -6,6 +6,8 @@ Run (from VocabTailor):
   cd VocabTailor && PYTHONPATH=src python examples/quickstart_mt_qwen3.py [--model MODEL]
 
 Defaults: model Qwen/Qwen3-1.7B; profiling_file = static_vocab/qwen3/mt_en_zh/Qwen3_unicode_set_chinese_tol_0.01.json (from package).
+enable_metrics_tracker is not set (default False). To record per-run timing, pass
+enable_metrics_tracker=True to from_pretrained(); after generate(), metrics are in vt.gen_metrics.
 """
 import os
 import sys
@@ -54,6 +56,7 @@ def main():
         lmdb_path=None,
         vocab_resize_strategy="prealloc",
         profiling_file=default_profiling,
+        enable_metrics_tracker=False,
     )
     tokenizer = vt.tokenizer
 
@@ -70,7 +73,7 @@ def main():
         return_tensors="pt",
     )
     
-    outputs, metrics = vt.generate(
+    output_ids = vt.generate(
         inputs,
         mode="input_aware",
         max_new_tokens=2048,
@@ -78,15 +81,11 @@ def main():
         original_eos_token_id=tokenizer.eos_token_id,
     )
 
-    output_text = tokenizer.batch_decode(outputs.cpu())[0]
+    output_text = tokenizer.batch_decode(output_ids.to("cpu"))[0]
 
     print(f"\n{'-'*50}\nDecoded output:")
     print(output_text)
     print(f"{'-'*50}\n")
-    
-    if metrics:
-        print("Metrics (prefill_tps, decode_tps):", metrics.get("prefill_tps"), metrics.get("decode_tps"))
-
     print("\nDone.")
 
 

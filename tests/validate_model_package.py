@@ -155,6 +155,9 @@ def main() -> int:
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="Target device to move transformer blocks.")
     parser.add_argument("--dtype", type=str, choices=["bf16", "fp16", "fp32"], default="fp32", help="Model dtype.")
     parser.add_argument("--local_files_only", action="store_true", help="Use only local files for Hugging Face model/tokenizer.")
+    parser.add_argument("--output_dir", type=str, default=None, help="Output directory for results. Default: results/machine_translation/{args.source_lang}-{args.target_lang}/eval under repo root.")
+    parser.add_argument("--save_predictions", action="store_true", help="Save extracted predictions to .pth")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Increase output verbosity.")
     parser.add_argument("--compare", action="store_true", help="Compare generated metrics with golden metrics.")
     args = parser.parse_args()
 
@@ -180,9 +183,9 @@ def main() -> int:
     if evaluate is None:
         print("evaluate is required: pip install evaluate", file=sys.stderr)
         return 1
-
+    
     # Initialize output file path
-    short_name = infer_short_model_name(args.model_name)
+    short_model_name = infer_short_model_name(args.model_name)
 
     if args.prefix is None:
         prefix = "vt"
@@ -192,13 +195,13 @@ def main() -> int:
             prefix += "_d" # dynamic-only
         else:
             prefix += "_s" # static-only
-
-        if args.sample_size is not None:
-            prefix += f"_sample{args.sample_size}"
     else:
         prefix = args.prefix
+    
+    if args.sample_size is not None:
+        prefix += f"_sample{args.sample_size}"
 
-    base_name = f"{short_name}_{args.dtype}_{prefix}_mt_eval_{args.source_lang}_{args.target_lang}"
+    base_name = f"{short_model_name}_{args.dtype}_{prefix}_mt_eval_{args.source_lang}_{args.target_lang}"
     
     if args.device != "cuda":
         base_name += f"_{args.device}"
@@ -211,7 +214,7 @@ def main() -> int:
     if args.lmdb_path:
         base_name += "_lmdb"
 
-    output_dir = f"{_REPO_ROOT}/results/machine_translation/{args.source_lang}-{args.target_lang}"
+    output_dir = f"{_REPO_ROOT}/results/machine_translation/{args.source_lang}-{args.target_lang}/eval" if args.output_dir is None else args.output_dir
     os.makedirs(output_dir, exist_ok = True)
     os.makedirs(f"{output_dir}/logs", exist_ok = True)
     log_file = f"{output_dir}/logs/{base_name}.log"
@@ -227,7 +230,7 @@ def main() -> int:
     logger = logging.getLogger(__name__)
 
     filtered_dataset = load_mt_dataset(dataset_path, sample_size=args.sample_size)
-    logger.info("Dataset loaded: %d rows", len(filtered_dataset))
+    logger.info(f"Dataset loaded: {len(filtered_dataset)} rows")
 
     logger.info("Loading VocabTailor...")
     model_kwargs = {}
@@ -242,11 +245,11 @@ def main() -> int:
         dtype=args.dtype,
         lmdb_path=args.lmdb_path,
         vocab_resize_strategy=args.vocab_resize_strategy,
-        tokenizer_kwargs=tokenizer_kwargs,
         profiling_file=profiling_path,
+        enable_metrics_tracker=False,
+        tokenizer_kwargs=tokenizer_kwargs,
         **model_kwargs,
     )
-    vt.tracker = None
     tokenizer = vt.tokenizer
     original_eos_token_id = tokenizer.eos_token_id
     logger.info("Finish loading VocabTailor")
@@ -260,12 +263,12 @@ def main() -> int:
         logger.info(f"{'embedding':<20} {str(vt.model.model.embed_tokens.full_embedding.weight.dtype):<20} {str(vt.model.model.embed_tokens.device):<10}")
     logger.info(f"{'lm head':<20} {str(vt.model.lm_head.weight_dtype):<20} {str(vt.model.lm_head.device):<10}")
     logger.info(f"{'transformer body':<20} {str(vt.model.dtype):<20} {str(args.device):<10}")
-
-    source_label = LANGUAGE_DICT[args.source_lang]
-    target_label = LANGUAGE_DICT[args.target_lang]
+    
+    source_lang = LANGUAGE_DICT[args.source_lang]
+    target_lang = LANGUAGE_DICT[args.target_lang]
     filtered_dataset = filtered_dataset.map(
         apply_mt_template,
-        fn_kwargs={"source": source_label, "target": target_label},
+        fn_kwargs={"source": source_lang, "target": target_lang},
         batched=False,
     )
 
@@ -279,19 +282,28 @@ def main() -> int:
     extracted_pred = []
     
     for i, message in enumerate(filtered_dataset["chat_messages"]):
-        print(f"\n{'=' * 50}\nProcessing Example {i + 1}/{N}\n{'='*50}\n")
+        if args.verbose:
+            print(f"\n{'=' * 50}\nProcessing Example {i + 1}/{N}\n{'='*50}\n")
 
         # Input
-        inputs = tokenizer.apply_chat_template(
-            message,
-            tokenize=True,
-            add_generation_prompt=True,
-            enable_thinking=False,
-            return_tensors="pt",
-        )
+        if "Qwen3" in args.model_name:
+            inputs = tokenizer.apply_chat_template(
+                message,
+                tokenize=True,
+                add_generation_prompt=True,
+                enable_thinking=False,
+                return_tensors="pt",
+            )
+        else:
+            inputs = tokenizer.apply_chat_template(
+                message,
+                tokenize=True,
+                add_generation_prompt=True,
+                return_tensors="pt",
+            )
 
         # Generate
-        outputs, _ = vt.generate(
+        output_ids = vt.generate(
             inputs,
             mode=mode,
             max_new_tokens=2048,
@@ -300,16 +312,17 @@ def main() -> int:
         )
 
         # Decode & Prediction
-        output_text = tokenizer.batch_decode(outputs.cpu())[0]
-        extracted_text = extract_prediction(output_text, short_name)
+        output_text = tokenizer.batch_decode(output_ids.to("cpu"))[0]
+        extracted_text = extract_prediction(output_text, short_model_name)
 
         # Append results
         extracted_pred.append(extracted_text)
 
         # Print results
-        print(f"Translation Result\n{'-'*40}")
-        print(f"{source_label}: {filtered_dataset['source'][i]}\n")
-        print(f"{target_label}: {extracted_text}\n")
+        if args.verbose:
+            print(f"Translation Result\n{'-'*40}")
+            print(f"{source_lang}: {filtered_dataset['source'][i]}\n")
+            print(f"{target_lang}: {extracted_text}\n")
 
         if i % 100 == 0:
             logger.info(f"Complete examples {i + 1}/{N}")
@@ -345,8 +358,9 @@ def main() -> int:
         json.dump(metrics, f, indent=4)
     logger.info(f"Metrics saved to {output_file}")
 
-    torch.save(extracted_pred, pred_file)
-    logger.info(f"Predictions saved to {pred_file}")
+    if args.save_predictions:
+        torch.save(extracted_pred, pred_file)
+        logger.info(f"Predictions saved to {pred_file}")
 
     #----------------------
     # Compare with Golden Metrics
